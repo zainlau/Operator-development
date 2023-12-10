@@ -1,0 +1,15 @@
+#include <iostream>
+
+int main() {
+    int x = 10;
+
+    // 使用Lambda表达式创建闭包
+    auto closure = [x]() {
+        std::cout << "x is: " << x << std::endl;
+    };
+
+    // 调用闭包
+    closure();
+
+    return 0;
+}
