@@ -1,0 +1,54 @@
+# import json
+# import matplotlib.pyplot as plt
+#
+# with open('E:\pythonllama\model_analysis_results.json', 'r') as f:
+#     data = json.load(f)
+#
+#
+# loss_data = data['en-us']['precision_performance']['pr']['line_chart']['pr_line_chart']['curve']['loss']
+#
+# loss_data.sort(key=lambda x: x[0])
+#
+# x_values = [item[0] for item in loss_data]
+# y_values = [item[1] for item in loss_data]
+#
+# plt.plot(x_values, y_values)
+# plt.xlabel('Step')
+# plt.ylabel('Loss')
+# plt.title('Loss line chart of model')
+# plt.show()
+
+import json
+import matplotlib.pyplot as plt
+import numpy as np
+from scipy.interpolate import make_interp_spline
+
+# 读取json文件
+with open('./model_analysis_results.json', 'r') as f:
+    data = json.load(f)
+
+# 提取loss值
+loss_data = data['en-us']['precision_performance']['pr']['line_chart']['pr_line_chart']['curve']['loss']
+
+# 对loss数据进行排序，确保x轴（步骤）是按顺序的
+loss_data.sort(key=lambda x: x[0])
+
+# 提取x和y的值
+x_values = [item[0] for item in loss_data]
+y_values = [item[1] for item in loss_data]
+
+# 创建插值函数
+spl = make_interp_spline(x_values, y_values)
+
+# 创建平滑的x值
+x_smooth = np.linspace(min(x_values), max(x_values), 500)
+
+# 计算平滑的y值
+y_smooth = spl(x_smooth)
+
+# 绘制平滑的loss曲线图
+plt.plot(x_smooth, y_smooth)
+plt.xlabel('Step')
+plt.ylabel('Loss')
+plt.title('Loss')
+plt.show()
