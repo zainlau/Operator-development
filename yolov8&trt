@@ -1,0 +1,724 @@
+"""
+An example that uses TensorRT's Python api to make inferences.
+"""
+import ctypes
+import os
+import shutil
+import random
+import sys
+import threading
+import time
+import cv2
+import re
+import numpy as np
+import pycuda.autoinit
+import pycuda.driver as cuda
+import tensorrt as trt
+import math
+import logging
+import ovfi_logs.logger_config as logger_config
+ 
+from threading import Thread
+from pathlib import Path
+# from utils.general import LOGGER
+from person_car_detect.area import *
+from decoder_video.get_picture_info import *
+
+from config.config import getConfig
+from oss.oss_api import HandleOSS
+
+
+temp_dir = getConfig("config.ini", 'compare', 'TEMP_DIR')
+download_dir_name = getConfig("config.ini", 'compare', 'DOWNLOAD_DIR')
+new_flag = getConfig("config.ini", 'compare', 'NEW_FLAG')
+time_interval = getConfig("config.ini", 'compare', 'TIME_INTERVAL')
+PLUGIN_LIBRARY = getConfig("config.ini", 'compare', 'PLUGIN_LIBRARY_PC')
+engine_file_path = getConfig("config.ini", 'compare', 'PC_ENGINE_FILE_PATH')
+current_path = os.path.split(os.path.realpath(__file__))[0]
+temp_dir = os.path.join(current_path,"../",temp_dir)
+
+if not os.path.exists(temp_dir):
+    os.mkdir(temp_dir)
+ 
+download_dir = os.path.join(temp_dir,download_dir_name)
+if not os.path.exists(download_dir):
+    os.mkdir(download_dir)
+
+
+CONF_THRESH = 0.7
+IOU_THRESHOLD = 0.4
+categories = ["bicycle", "bus", "car", "motorbike", "train", "person"]
+
+def get_img_path_batches(batch_size, img_dir):
+    ret = []
+    batch = []
+    for root, dirs, files in os.walk(img_dir):
+        for name in files:
+            if len(batch) == batch_size:
+                ret.append(batch)
+                batch = []
+            batch.append(os.path.join(root, name))
+    if len(batch) > 0:
+        ret.append(batch)
+    return ret
+
+
+def plot_one_box(x, img, color=None, label=None, line_thickness=None):
+    """
+    description: Plots one bounding box on image img,
+                 this function comes from YoLov8 project.
+    param: 
+        x:      a box likes [x1,y1,x2,y2]
+        img:    a opencv image object
+        color:  color to draw rectangle, such as (0,255,0)
+        label:  str
+        line_thickness: int
+    return:
+        no return
+
+    """
+    tl = (
+            line_thickness or round(0.002 * (img.shape[0] + img.shape[1]) / 2) + 1
+    )  # line/font thickness
+    color = color or [random.randint(0, 255) for _ in range(3)]
+    c1, c2 = (int(x[0]), int(x[1])), (int(x[2]), int(x[3]))
+    cv2.rectangle(img, c1, c2, color, thickness=tl, lineType=cv2.LINE_AA)
+    if label:
+        tf = max(tl - 1, 1)  # font thickness
+        t_size = cv2.getTextSize(label, 0, fontScale=tl / 3, thickness=tf)[0]
+        c2 = c1[0] + t_size[0], c1[1] - t_size[1] - 3
+        cv2.rectangle(img, c1, c2, color, -1, cv2.LINE_AA)  # filled
+        cv2.putText(
+            img,
+            label,
+            (c1[0], c1[1] - 2),
+            0,
+            tl / 3,
+            [225, 255, 255],
+            thickness=tf,
+            lineType=cv2.LINE_AA,
+        )
+
+def plot_box(x, img, color=None, label=None, line_thickness=None):
+    """
+    description: Plots one bounding and area box on image img,
+                 this function comes from YoLov5 project.
+    param:
+        x:      a box likes [x1,y1,x2,y2]
+        img:    a opencv image object
+        color:  color to draw rectangle, such as (0,255,0)
+        label:  str
+        line_thickness: int
+    return:
+        no return
+ 
+    """
+    tl = (
+        line_thickness or round(0.002 * (img.shape[0] + img.shape[1]) / 2) + 1
+    )  # line/font thickness
+    color = color or [random.randint(0, 255) for _ in range(3)]
+    c1, c2 = (int(x[0]), int(x[1])), (int(x[2]), int(x[3]))
+    cv2.rectangle(img, c1, c2, color, thickness=tl, lineType=cv2.LINE_AA)
+ 
+    if label:
+        tf = max(tl - 1, 1)  # font thickness
+        t_size = cv2.getTextSize(label, 0, fontScale=tl / 3, thickness=tf)[0]
+        c2 = c1[0] + t_size[0], c1[1] - t_size[1] - 3
+        cv2.rectangle(img, c1, c2, color, -1, cv2.LINE_AA)  # filled
+        cv2.putText(
+            img,
+            label,
+            (c1[0], c1[1] - 2),
+            0,
+            tl / 3,
+            [225, 255, 255],
+            thickness=tf,
+            lineType=cv2.LINE_AA,
+        )
+
+class YoLov8TRT(object):
+    """
+    description: A YOLOv8 class that warps TensorRT ops, preprocess and postprocess ops.
+    """
+
+    def __init__(self, engine_file_path, detect_area):
+        # Create a Context on this device,
+        cuda.init()
+        self.ctx = cuda.Device(0).make_context()
+        stream = cuda.Stream()
+        TRT_LOGGER = trt.Logger(trt.Logger.INFO)
+        runtime = trt.Runtime(TRT_LOGGER)
+        self.detection_area = detect_area
+
+        # Deserialize the engine from file
+        with open(engine_file_path, "rb") as f:
+            engine = runtime.deserialize_cuda_engine(f.read())
+        context = engine.create_execution_context()
+
+        host_inputs = []
+        cuda_inputs = []
+        host_outputs = []
+        cuda_outputs = []
+        bindings = []
+
+        for binding in engine:
+            print('bingding:', binding, engine.get_binding_shape(binding))
+            size = trt.volume(engine.get_binding_shape(binding)) * engine.max_batch_size
+            dtype = trt.nptype(engine.get_binding_dtype(binding))
+            # Allocate host and device buffers
+            host_mem = cuda.pagelocked_empty(size, dtype)
+            cuda_mem = cuda.mem_alloc(host_mem.nbytes)
+            # Append the device buffer to device bindings.
+            bindings.append(int(cuda_mem))
+            # Append to the appropriate list.
+            if engine.binding_is_input(binding):
+                self.input_w = engine.get_binding_shape(binding)[-1]
+                self.input_h = engine.get_binding_shape(binding)[-2]
+                host_inputs.append(host_mem)
+                cuda_inputs.append(cuda_mem)
+            else:
+                host_outputs.append(host_mem)
+                cuda_outputs.append(cuda_mem)
+
+        # Store
+        self.stream = stream
+        self.context = context
+        self.engine = engine
+        self.host_inputs = host_inputs
+        self.cuda_inputs = cuda_inputs
+        self.host_outputs = host_outputs
+        self.cuda_outputs = cuda_outputs
+        self.bindings = bindings
+        self.batch_size = engine.max_batch_size
+
+    def infer(self, raw_image_generator):
+        threading.Thread.__init__(self)
+        # Make self the active context, pushing it on top of the context stack.
+        self.ctx.push()
+        # Restore
+        stream = self.stream
+        context = self.context
+        engine = self.engine
+        host_inputs = self.host_inputs
+        cuda_inputs = self.cuda_inputs
+        host_outputs = self.host_outputs
+        cuda_outputs = self.cuda_outputs
+        bindings = self.bindings
+        # Do image preprocess
+        batch_image_raw = []
+        batch_origin_h = []
+        batch_origin_w = []
+        num_dic = {}
+
+        batch_input_image = np.empty(shape=[self.batch_size, 3, self.input_h, self.input_w])
+        for i, image_raw in enumerate(raw_image_generator):
+            input_image, image_raw, origin_h, origin_w = self.preprocess_image(image_raw)
+            batch_image_raw.append(image_raw)
+            batch_origin_h.append(origin_h)
+            batch_origin_w.append(origin_w)
+            np.copyto(batch_input_image[i], input_image)
+        batch_input_image = np.ascontiguousarray(batch_input_image)
+
+        # Copy input image to host buffer
+        np.copyto(host_inputs[0], batch_input_image.ravel())
+        start = time.time()
+        # Transfer input data  to the GPU.
+        cuda.memcpy_htod_async(cuda_inputs[0], host_inputs[0], stream)
+        # Run inference.
+        context.execute_async(batch_size=self.batch_size, bindings=bindings, stream_handle=stream.handle)
+        # Transfer predictions back from the GPU.
+        cuda.memcpy_dtoh_async(host_outputs[0], cuda_outputs[0], stream)
+        # Synchronize the stream
+        stream.synchronize()
+        end = time.time()
+        # Remove any context from the top of the context stack, deactivating it.
+        self.ctx.pop()
+        # Here we use the first row of output in that batch_size = 1
+        output = host_outputs[0]
+        # Do postprocess
+        for i in range(self.batch_size):
+            result_boxes, result_scores, result_classid = self.post_process(
+                output[i * 38001: (i + 1) * 38001], batch_origin_h[i], batch_origin_w[i]
+            )
+ 
+            # 根据坐标点画出区域线
+            # area_point1 = (int(self.detection_area[0]), int(self.detection_area[1]))
+            # area_point2 = (int(self.detection_area[2]), int(self.detection_area[3]))
+            # cv2.rectangle(batch_image_raw[i], area_point1, area_point2, (255, 191, 52), thickness = 3)
+            for x in range(len(categories)):
+                num_dic[categories[x]] = 0
+            # Draw rectangles and labels on the original image
+            for j in range(len(result_boxes)):
+                box = result_boxes[j]
+                # print('int(result_classid[j])', int(result_classid[j]))
+                if categories[int(result_classid[j])] in num_dic.keys():
+                    num_dic[categories[int(result_classid[j])]] += 1
+                else:
+                    pass
+                plot_one_box(
+                    box,
+                    batch_image_raw[i],
+                    label="{}:{:.2f}".format(
+                        categories[int(result_classid[j])], result_scores[j]
+                    ),
+                )
+        return batch_image_raw, end - start, num_dic
+
+    def destroy(self):
+        # Remove any context from the top of the context stack, deactivating it.
+        self.ctx.pop()
+
+    def get_raw_image(self, image_path_batch):
+        """
+        description: Read an image from image path
+        """
+        for img_path in image_path_batch:
+            yield cv2.imread(img_path)
+
+    def get_raw_image_zeros(self, image_path_batch=None):
+        """
+        description: Ready data for warmup
+        """
+        for _ in range(self.batch_size):
+            yield np.zeros([self.input_h, self.input_w, 3], dtype=np.uint8)
+
+    def preprocess_image(self, raw_bgr_image):
+        """
+        description: Convert BGR image to RGB,
+                     resize and pad it to target size, normalize to [0,1],
+                     transform to NCHW format.
+        param:
+            input_image_path: str, image path
+        return:
+            image:  the processed image
+            image_raw: the original image
+            h: original height
+            w: original width
+        """
+        image_raw = raw_bgr_image
+        h, w, c = image_raw.shape
+        image = cv2.cvtColor(image_raw, cv2.COLOR_BGR2RGB)
+        # Calculate widht and height and paddings
+        r_w = self.input_w / w
+        r_h = self.input_h / h
+        if r_h > r_w:
+            tw = self.input_w
+            th = int(r_w * h)
+            tx1 = tx2 = 0
+            ty1 = int((self.input_h - th) / 2)
+            ty2 = self.input_h - th - ty1
+        else:
+            tw = int(r_h * w)
+            th = self.input_h
+            tx1 = int((self.input_w - tw) / 2)
+            tx2 = self.input_w - tw - tx1
+            ty1 = ty2 = 0
+        # Resize the image with long side while maintaining ratio
+        image = cv2.resize(image, (tw, th))
+        # Pad the short side with (128,128,128)
+        image = cv2.copyMakeBorder(
+            image, ty1, ty2, tx1, tx2, cv2.BORDER_CONSTANT, None, (128, 128, 128)
+        )
+        image = image.astype(np.float32)
+        # Normalize to [0,1]
+        image /= 255.0
+        # HWC to CHW format:
+        image = np.transpose(image, [2, 0, 1])
+        # CHW to NCHW format
+        image = np.expand_dims(image, axis=0)
+        # Convert the image to row-major order, also known as "C order":
+        image = np.ascontiguousarray(image)
+        return image, image_raw, h, w
+
+    def xywh2xyxy(self, origin_h, origin_w, x):
+        """
+        description:    Convert nx4 boxes from [x, y, w, h] to [x1, y1, x2, y2] where xy1=top-left, xy2=bottom-right
+        param:
+            origin_h:   height of original image
+            origin_w:   width of original image
+            x:          A boxes numpy, each row is a box [center_x, center_y, w, h]
+        return:
+            y:          A boxes numpy, each row is a box [x1, y1, x2, y2]
+        """
+        y = np.zeros_like(x)
+        r_w = self.input_w / origin_w
+        r_h = self.input_h / origin_h
+        if r_h > r_w:
+            y[:, 0] = x[:, 0]
+            y[:, 2] = x[:, 2]
+            y[:, 1] = x[:, 1] - (self.input_h - r_w * origin_h) / 2
+            y[:, 3] = x[:, 3] - (self.input_h - r_w * origin_h) / 2
+            y /= r_w
+        else:
+            y[:, 0] = x[:, 0] - (self.input_w - r_h * origin_w) / 2
+            y[:, 2] = x[:, 2] - (self.input_w - r_h * origin_w) / 2
+            y[:, 1] = x[:, 1]
+            y[:, 3] = x[:, 3]
+            y /= r_h
+
+        return y
+
+    def post_process(self, output, origin_h, origin_w):
+        """
+        description: postprocess the prediction
+        param:
+            output:     A numpy likes [num_boxes,cx,cy,w,h,conf,cls_id, cx,cy,w,h,conf,cls_id, ...] 
+            origin_h:   height of original image
+            origin_w:   width of original image
+        return:
+            result_boxes: finally boxes, a boxes numpy, each row is a box [x1, y1, x2, y2]
+            result_scores: finally scores, a numpy, each element is the score correspoing to box
+            result_classid: finally classid, a numpy, each element is the classid correspoing to box
+        """
+        # Get the num of boxes detected
+        num = int(output[0])
+        # Reshape to a two dimentional ndarray
+        pred = np.reshape(output[1:], (-1, 38))[:num, :]
+        # Do nms
+        boxes = self.non_max_suppression(pred, origin_h, origin_w, conf_thres=CONF_THRESH, nms_thres=IOU_THRESHOLD)
+        result_boxes = boxes[:, :4] if len(boxes) else np.array([])
+        result_scores = boxes[:, 4] if len(boxes) else np.array([])
+        result_classid = boxes[:, 5] if len(boxes) else np.array([])
+        return result_boxes, result_scores, result_classid
+
+    def bbox_iou(self, box1, box2, x1y1x2y2=True):
+        """
+        description: compute the IoU of two bounding boxes
+        param:
+            box1: A box coordinate (can be (x1, y1, x2, y2) or (x, y, w, h))
+            box2: A box coordinate (can be (x1, y1, x2, y2) or (x, y, w, h))            
+            x1y1x2y2: select the coordinate format
+        return:
+            iou: computed iou
+        """
+        if not x1y1x2y2:
+            # Transform from center and width to exact coordinates
+            b1_x1, b1_x2 = box1[:, 0] - box1[:, 2] / 2, box1[:, 0] + box1[:, 2] / 2
+            b1_y1, b1_y2 = box1[:, 1] - box1[:, 3] / 2, box1[:, 1] + box1[:, 3] / 2
+            b2_x1, b2_x2 = box2[:, 0] - box2[:, 2] / 2, box2[:, 0] + box2[:, 2] / 2
+            b2_y1, b2_y2 = box2[:, 1] - box2[:, 3] / 2, box2[:, 1] + box2[:, 3] / 2
+        else:
+            # Get the coordinates of bounding boxes
+            b1_x1, b1_y1, b1_x2, b1_y2 = box1[:, 0], box1[:, 1], box1[:, 2], box1[:, 3]
+            b2_x1, b2_y1, b2_x2, b2_y2 = box2[:, 0], box2[:, 1], box2[:, 2], box2[:, 3]
+
+        # Get the coordinates of the intersection rectangle
+        inter_rect_x1 = np.maximum(b1_x1, b2_x1)
+        inter_rect_y1 = np.maximum(b1_y1, b2_y1)
+        inter_rect_x2 = np.minimum(b1_x2, b2_x2)
+        inter_rect_y2 = np.minimum(b1_y2, b2_y2)
+        # Intersection area
+        inter_area = np.clip(inter_rect_x2 - inter_rect_x1 + 1, 0, None) * \
+                     np.clip(inter_rect_y2 - inter_rect_y1 + 1, 0, None)
+        # Union Area
+        b1_area = (b1_x2 - b1_x1 + 1) * (b1_y2 - b1_y1 + 1)
+        b2_area = (b2_x2 - b2_x1 + 1) * (b2_y2 - b2_y1 + 1)
+
+        iou = inter_area / (b1_area + b2_area - inter_area + 1e-16)
+
+        return iou
+
+    def non_max_suppression(self, prediction, origin_h, origin_w, conf_thres=0.5, nms_thres=0.4):
+        """
+        description: Removes detections with lower object confidence score than 'conf_thres' and performs
+        Non-Maximum Suppression to further filter detections.
+        param:
+            prediction: detections, (x1, y1, x2, y2, conf, cls_id)
+            origin_h: original image height
+            origin_w: original image width
+            conf_thres: a confidence threshold to filter detections
+            nms_thres: a iou threshold to filter detections
+        return:
+            boxes: output after nms with the shape (x1, y1, x2, y2, conf, cls_id)
+        """
+        # Get the boxes that score > CONF_THRESH
+        # print('prediction[:, 4]', prediction[:, 4])
+        boxes = prediction[prediction[:, 4] >= conf_thres]
+        # Trandform bbox from [center_x, center_y, w, h] to [x1, y1, x2, y2]
+        boxes[:, :4] = self.xywh2xyxy(origin_h, origin_w, boxes[:, :4])
+        # clip the coordinates
+        boxes[:, 0] = np.clip(boxes[:, 0], 0, origin_w - 1)
+        boxes[:, 2] = np.clip(boxes[:, 2], 0, origin_w - 1)
+        boxes[:, 1] = np.clip(boxes[:, 1], 0, origin_h - 1)
+        boxes[:, 3] = np.clip(boxes[:, 3], 0, origin_h - 1)
+        # Object confidence
+        confs = boxes[:, 4]
+        # Sort by the confs
+        boxes = boxes[np.argsort(-confs)]
+        # Perform non-maximum suppression
+        keep_boxes = []
+        while boxes.shape[0]:
+            large_overlap = self.bbox_iou(np.expand_dims(boxes[0, :4], 0), boxes[:, :4]) > nms_thres
+            label_match = boxes[0, -1] == boxes[:, -1]
+            # Indices of boxes with lower confidence scores, large IOUs and matching labels
+            invalid = large_overlap & label_match
+            keep_boxes += [boxes[0]]
+            boxes = boxes[~invalid]
+        boxes = np.stack(keep_boxes, 0) if len(keep_boxes) else np.array([])
+        return boxes
+
+
+class inferThread(threading.Thread):
+    def __init__(self, yolov8_wrapper, image_path_batch):
+        threading.Thread.__init__(self)
+        self.yolov8_wrapper = yolov8_wrapper
+        self.image_path_batch = image_path_batch
+        self.cls_dic = {}
+    def run(self):
+        batch_image_raw, use_time, num = self.yolov8_wrapper.infer(self.yolov8_wrapper.get_raw_image(self.image_path_batch))
+        for i, img_path in enumerate(self.image_path_batch):
+            parent, filename = os.path.split(img_path)
+            save_name = os.path.join('output', filename)
+            # Save image
+            cv2.imwrite(save_name, batch_image_raw[i])
+        print('input->{}, time->{:.2f}ms, saving into output/'.format(self.image_path_batch, use_time * 1000))
+        self.cls_dic = num
+
+
+class warmUpThread(threading.Thread):
+    def __init__(self, yolov8_wrapper):
+        threading.Thread.__init__(self)
+        self.yolov8_wrapper = yolov8_wrapper
+
+    def run(self):
+        batch_image_raw, use_time, num = self.yolov8_wrapper.infer(self.yolov8_wrapper.get_raw_image_zeros())
+        print('warm_up->{}, time->{:.2f}ms'.format(batch_image_raw[0].shape, use_time * 1000))
+
+
+def clean_str(s):
+    """
+    Cleans a string by replacing special characters with underscore _
+
+    Args:
+        s (str): a string needing special characters replaced
+
+    Returns:
+        (str): a string with special characters replaced by an underscore _
+    """
+    return re.sub(pattern='[|@#!¡·$€%&()=?¿^*;:,¨´><+]', repl='_', string=s)
+
+class LoadStreams:
+    """
+    Stream Loader for various types of video streams.
+
+    Suitable for use with `yolo predict source='rtsp://example.com/media.mp4'`, supports RTSP, RTMP, HTTP, and TCP streams.
+
+    Attributes:
+        sources (str): The source input paths or URLs for the video streams.
+        imgsz (int): The image size for processing, defaults to 640.
+        vid_stride (int): Video frame-rate stride, defaults to 1.
+        buffer (bool): Whether to buffer input streams, defaults to False.
+        running (bool): Flag to indicate if the streaming thread is running.
+        mode (str): Set to 'stream' indicating real-time capture.
+        imgs (list): List of image frames for each stream.
+        fps (list): List of FPS for each stream.
+        frames (list): List of total frames for each stream.
+        threads (list): List of threads for each stream.
+        shape (list): List of shapes for each stream.
+        caps (list): List of cv2.VideoCapture objects for each stream.
+        bs (int): Batch size for processing.
+
+    Methods:
+        __init__: Initialize the stream loader.
+        update: Read stream frames in daemon thread.
+        close: Close stream loader and release resources.
+        __iter__: Returns an iterator object for the class.
+        __next__: Returns source paths, transformed, and original images for processing.
+        __len__: Return the length of the sources object.
+    """
+
+    def __init__(self, sources='file.streams', imgsz=640, vid_stride=1, buffer=False):
+        """Initialize instance variables and check for consistent input stream shapes."""
+        torch.backends.cudnn.benchmark = True  # faster for fixed-size inference
+        self.buffer = buffer  # buffer input streams
+        self.running = True  # running flag for Thread
+        self.mode = 'stream'
+        self.imgsz = imgsz
+        self.vid_stride = int(vid_stride)  # video frame-rate stride
+
+        # sources = Path(sources).read_text().rsplit() if os.path.isfile(sources) else [sources]
+        n = len(sources)
+        self.fps = [0] * n  # frames per second
+        self.frames = [0] * n
+        self.threads = [None] * n
+        self.caps = [None] * n  # video capture objects
+        self.imgs = [[] for _ in range(n)]  # images
+        self.shape = [[] for _ in range(n)]  # image shapes
+        self.sources = [clean_str(x) for x in sources]  # clean source names for later
+        for i, s in enumerate(sources):  # index, source
+            # Start thread to read frames from video stream
+            st = f'{i + 1}/{n}: {s}... '
+
+            s = eval(s) if s.isnumeric() else s  # i.e. s = '0' local webcam
+
+            self.caps[i] = cv2.VideoCapture(s)  # store video capture object
+            if not self.caps[i].isOpened():
+                raise ConnectionError(f'{st}Failed to open {s}')
+            w = int(self.caps[i].get(cv2.CAP_PROP_FRAME_WIDTH))
+            h = int(self.caps[i].get(cv2.CAP_PROP_FRAME_HEIGHT))
+            fps = self.caps[i].get(cv2.CAP_PROP_FPS)  # warning: may return 0 or nan
+            self.frames[i] = max(int(self.caps[i].get(cv2.CAP_PROP_FRAME_COUNT)), 0) or float(
+                'inf')  # infinite stream fallback
+            self.fps[i] = max((fps if math.isfinite(fps) else 0) % 100, 0) or 30  # 30 FPS fallback
+
+            success, im = self.caps[i].read()  # guarantee first frame
+            if not success or im is None:
+                raise ConnectionError(f'{st}Failed to read images from {s}')
+            self.imgs[i].append(im)
+            self.shape[i] = im.shape
+            self.threads[i] = Thread(target=self.update, args=([i, self.caps[i], s]), daemon=True)
+            logging.info(f'{st}Success ✅ ({self.frames[i]} frames of shape {w}x{h} at {self.fps[i]:.2f} FPS)')
+            self.threads[i].start()
+        logging.info('')  # newline
+
+        # Check for common shapes
+        self.bs = self.__len__()
+
+    def update(self, i, cap, stream):
+        """Read stream `i` frames in daemon thread."""
+        n, f = 0, self.frames[i]  # frame number, frame array
+        while self.running and cap.isOpened() and n < (f - 1):
+            if len(self.imgs[i]) < 30:  # keep a <=30-image buffer
+                n += 1
+                cap.grab()  # .read() = .grab() followed by .retrieve()
+                if n % self.vid_stride == 0:
+                    success, im = cap.retrieve()
+                    if not success:
+                        im = np.zeros(self.shape[i], dtype=np.uint8)
+                        logging.warning('WARNING ⚠️ Video stream unresponsive, please check your IP camera connection.')
+                        cap.open(stream)  # re-open stream if signal was lost
+                    if self.buffer:
+                        self.imgs[i].append(im)
+                    else:
+                        self.imgs[i] = [im]
+            else:
+                time.sleep(0.01)  # wait until the buffer is empty
+
+    def close(self):
+        """Close stream loader and release resources."""
+        self.running = False  # stop flag for Thread
+        for thread in self.threads:
+            if thread.is_alive():
+                thread.join(timeout=5)  # Add timeout
+        for cap in self.caps:  # Iterate through the stored VideoCapture objects
+            try:
+                cap.release()  # release video capture
+            except Exception as e:
+                logging.warning(f'WARNING ⚠️ Could not release VideoCapture object: {e}')
+        cv2.destroyAllWindows()
+
+    def __iter__(self):
+        """Iterates through YOLO image feed and re-opens unresponsive streams."""
+        self.count = -1
+        return self
+
+    def __next__(self):
+        """Returns source paths, transformed and original images for processing."""
+        self.count += 1
+
+        images = []
+        for i, x in enumerate(self.imgs):
+
+            # Wait until a frame is available in each buffer
+            while not x:
+                if not self.threads[i].is_alive() or cv2.waitKey(1) == ord('q'):  # q to quit
+                    self.close()
+                    raise StopIteration
+                time.sleep(1 / min(self.fps))
+                x = self.imgs[i]
+                if not x:
+                    logging.warning(f'WARNING ⚠️ Waiting for stream {i}')
+
+            # Get and remove the first frame from imgs buffer
+            if self.buffer:
+                images.append(x.pop(0))
+
+            # Get the last frame, and clear the rest from the imgs buffer
+            else:
+                images.append(x.pop(-1) if x else np.zeros(self.shape[i], dtype=np.uint8))
+                x.clear()
+
+        return self.sources, images, None, ''
+
+    def __len__(self):
+        """Return the length of the sources object."""
+        return len(self.sources)  # 1E12 frames = 32 streams at 30 FPS for 30 years
+
+
+def video_streams_v8(device_channel_info_list, url_list, vid_stride, detect_area):
+    from person_car_detect.person_car_picture import get_save_person_car_file, accesskey_Id, accesskey_Secret, bucket, \
+        person_car_update_files_test
+    from person_car_detect.person_car_api import send_person_car_info
+    # load custom plugin and engine
+
+    last_cls_num = None
+
+    ctypes.CDLL(PLUGIN_LIBRARY)
+    # load coco labels
+    # flag: 1--image, 0---streams and detect_area
+    area = eval(detect_area)
+    yolov8_wrapper = YoLov8TRT(engine_file_path, area)
+
+    try:
+        for i in range(10):
+            # create a new thread to do warm_up
+            thread1 = warmUpThread(yolov8_wrapper)
+            thread1.start()
+            thread1.join()
+
+        save_next_image = {i: True for i in range(len(url_list))}
+        last_detection_times = {i: time.time() for i in range(len(url_list))}
+        has_target = {i: False for i in range(len(url_list))}  # 记录是否检测到目标
+        dataset = LoadStreams(sources=url_list, vid_stride=vid_stride)
+
+        for path, im0s, vid_cap, s in dataset:
+
+            current_time = time.time()
+            # Check if it's been more than 1 minute since the last detection
+
+            current_cls_num = {}
+            for i, image in enumerate(im0s):
+                # show det_video
+                frame = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+                batch_image_raw, use_time, cls_num = yolov8_wrapper.infer([frame])
+                device_channel_info = device_channel_info_list[i]
+                device_id, channel_no, monitor_source, target = device_channel_info[0], device_channel_info[1], \
+                                                                device_channel_info[2], device_channel_info[3]
+                batch_image_raw[0] = cv2.cvtColor(batch_image_raw[0], cv2.COLOR_BGR2RGB)
+                cv2.imshow(f'{i+1}', batch_image_raw[0])
+
+                for key, value in cls_num.items():
+                    current_cls_num[key] = value
+                    if value > 0:
+                        has_target[i] = True
+
+                if current_time - last_detection_times[i] >= 60 and not has_target[i]:
+                    save_next_image[i] = True
+
+                # if the target was detected , save det_images in your path
+                if save_next_image[i] and has_target[i]:
+
+                    file_path_list = []
+                    file_name = str(device_id) + "_" + str(channel_no) + "_" + str(monitor_source) + "_" + str(
+                        target) + "_" + str(current_time) + ".jpg"
+                    file_path = os.path.join(download_dir, file_name)
+                    file_path_list.append(file_path)
+                    cv2.imwrite(file_path, batch_image_raw[0])
+
+                    save_file_path, save_new_file_path = get_save_person_car_file(device_id, channel_no, monitor_source,
+                                                                                  target)
+                    handleoss = HandleOSS(accesskey_Id, accesskey_Secret, bucket)
+
+                    for img_path in file_path_list:
+                        oss_file_path = person_car_update_files_test(img_path, save_file_path, handleoss)
+                        send_person_car_info(oss_file_path, monitor_source, cls_num)
+
+                    save_next_image[i] = False
+                    last_detection_times[i] = current_time
+
+                else:
+                    has_target[i] = False
+    finally:
+        yolov8_wrapper.destroy()
+
+
